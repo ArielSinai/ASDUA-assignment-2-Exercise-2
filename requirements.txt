@@ -4,3 +4,5 @@ Pillow
 transformers
 torch
 accelerate
+rapidfuzz
+prompt_toolkit

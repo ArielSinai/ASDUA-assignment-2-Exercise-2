@@ -7,13 +7,14 @@ import sys
 import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
-
+import os
 from PIL import Image
-
+import math
+from rapidfuzz import fuzz
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
-import os
+
 
 torch.set_num_threads(max(1, (os.cpu_count() or 4) - 1))
 
@@ -31,15 +32,13 @@ CAPTIONS_JSON = OUTPUT_ROOT / "scene_captions.json"
 
 FFMPEG_EXE = r"C:\Users\ariel\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
 
-
+COLLAGE_PATH = OUTPUT_ROOT / "collage.png"
+COLLAGE_THUMB = (256, 256)  
+FUZZ_THRESHOLD = 75        
 
 MIN_SCENE_LEN_FRAMES = 12
 
-
-
 YTDLP_FORMAT = "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
-
-
 
 MOONDREAM_MODEL_ID = "vikhyatk/moondream2"
 MOONDREAM_REVISION = None
@@ -303,17 +302,139 @@ def save_captions_json(captions: Dict[str, str], path: Path) -> None:
 
 
 
+def load_captions_json(path: Path) -> Dict[str, str]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+def find_scenes_exact(captions: Dict[str, str], word: str) -> List[str]:
+    w = word.strip().lower()
+    hits = []
+    for scene_id, cap in captions.items():
+        if w in str(cap).lower():
+            hits.append(str(scene_id))
+    return hits
+
+def find_scenes_fuzzy(captions: Dict[str, str], word: str, threshold: int = FUZZ_THRESHOLD) -> List[str]:
+    
+    w = word.strip().lower()
+    hits = []
+    for scene_id, cap in captions.items():
+        text = str(cap).lower()
+        score = fuzz.partial_ratio(w, text)
+        if score >= threshold:
+            hits.append(str(scene_id))
+    return hits
+
+def find_image_for_scene(images_dir: Path, scene_id: str) -> Optional[Path]:
+    
+    sid = int(scene_id)
+    patterns = [
+        f"*Scene-{sid:03d}-*.jpg",
+        f"*Scene-{sid:03d}-*.png",
+        f"*scene-{sid:03d}-*.jpg",
+        f"*scene-{sid:03d}-*.png",
+    ]
+    for pat in patterns:
+        matches = sorted(images_dir.glob(pat))
+        if matches:
+            return matches[0]
+    return None
+
+def make_collage(image_paths: List[Path], out_path: Path, thumb_size=COLLAGE_THUMB) -> None:
+    if not image_paths:
+        raise ValueError("No images to build collage from.")
+
+    thumbs = []
+    for p in image_paths:
+        with Image.open(p) as im:
+            im = im.convert("RGB")
+            im.thumbnail(thumb_size)
+            thumbs.append(im.copy())
+
+    n = len(thumbs)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+
+    cell_w, cell_h = thumb_size
+    collage = Image.new("RGB", (cols * cell_w, rows * cell_h), (255, 255, 255))
+
+    for idx, im in enumerate(thumbs):
+        r = idx // cols
+        c = idx % cols
+        x = c * cell_w
+        y = r * cell_h
+
+        
+        ox = x + (cell_w - im.width) // 2
+        oy = y + (cell_h - im.height) // 2
+        collage.paste(im, (ox, oy))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    collage.save(out_path)
+    
+
+
+
+def search_loop(images_dir: Path, captions_path: Path) -> None:
+    captions = load_captions_json(captions_path)
+
+    while True:
+        word = input("\nSearch the video using a word: ").strip()
+        if not word:
+            print("Empty input. Exiting search.")
+            return
+
+        exact = find_scenes_exact(captions, word)
+
+        fuzzy = find_scenes_fuzzy(captions, word, threshold=FUZZ_THRESHOLD)
+
+        hits = fuzzy if fuzzy else exact
+
+        if not hits:
+            print("No matching scenes found.")
+            continue
+
+        print(f"Found {len(hits)} scenes: {', '.join(hits)}")
+
+        image_paths = []
+        missing = []
+        for sid in hits:
+            p = find_image_for_scene(images_dir, sid)
+            if p:
+                image_paths.append(p)
+            else:
+                missing.append(sid)
+
+        if missing:
+            print("Warning: missing images for scenes:", ", ".join(missing))
+
+        if not image_paths:
+            print("No images were found for the matched scenes.")
+            continue
+
+        make_collage(image_paths, COLLAGE_PATH)
+        print(f"✅ Saved collage to: {COLLAGE_PATH}")
+        os.startfile(str(COLLAGE_PATH))
+
+
+
 
 def main() -> None:
-    
-    print("CAPTIONS_JSON =", CAPTIONS_JSON)
-    print("exists? =", CAPTIONS_JSON.exists())
+    downloads_dir, scenes_root = ensure_dirs()
+
+   
     if CAPTIONS_JSON.exists():
-        print(f"✅ Found existing {CAPTIONS_JSON}. Skipping download, scene detection, and captioning.")
+        
+        scene_dirs = [p for p in scenes_root.iterdir() if p.is_dir()]
+        if not scene_dirs:
+            print(f"Found {CAPTIONS_JSON} but no scenes folders in {scenes_root}.")
+            return
+        chosen_images_dir = max(scene_dirs, key=lambda p: p.stat().st_mtime)
+        print(f"✅ Found existing {CAPTIONS_JSON}. Skipping pipeline.")
+        print("Using scenes folder:", chosen_images_dir)
+        search_loop(chosen_images_dir, CAPTIONS_JSON)
         return
 
-
-    downloads_dir, scenes_root = ensure_dirs()
 
     print("Output root:", OUTPUT_ROOT)
     print("Downloading query:", QUERY)
@@ -324,7 +445,6 @@ def main() -> None:
     print("\nDetecting scenes and saving images...")
     chosen_images_dir = run_scenedetect_fixed(video_path, scenes_root)
 
-
     analyze_scene_diversity(chosen_images_dir, near_dup_threshold=NEAR_DUP_THRESHOLD)
 
     print("\nCaptioning each scene image with Moondream...")
@@ -333,9 +453,8 @@ def main() -> None:
     print(f"\nSaving captions JSON to: {CAPTIONS_JSON}")
     save_captions_json(captions, CAPTIONS_JSON)
 
-    print("\n✅ DONE")
-    print("Scene images folder:", chosen_images_dir)
-    print("Captions JSON:", CAPTIONS_JSON)
+    print("\n✅ DONE generating captions.")
+    search_loop(chosen_images_dir, CAPTIONS_JSON)
 
 
 if __name__ == "__main__":
