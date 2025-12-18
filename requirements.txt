@@ -1,3 +1,6 @@
 yt-dlp
 scenedetect[opencv]
 Pillow
+transformers
+torch
+accelerate
