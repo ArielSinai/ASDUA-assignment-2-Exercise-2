@@ -8,12 +8,22 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List
 import os
+
 from PIL import Image
 import math
 from rapidfuzz import fuzz
+from prompt_toolkit import prompt
+from prompt_toolkit.completion import WordCompleter
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
+
+
+import time
+from google import genai
+from google.genai import errors as genai_errors
+from dotenv import load_dotenv
+load_dotenv()
 
 
 torch.set_num_threads(max(1, (os.cpu_count() or 4) - 1))
@@ -33,8 +43,8 @@ CAPTIONS_JSON = OUTPUT_ROOT / "scene_captions.json"
 FFMPEG_EXE = r"C:\Users\ariel\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build\bin\ffmpeg.exe"
 
 COLLAGE_PATH = OUTPUT_ROOT / "collage.png"
-COLLAGE_THUMB = (256, 256)  
-FUZZ_THRESHOLD = 75        
+COLLAGE_THUMB = (256, 256)
+FUZZ_THRESHOLD = 75
 
 MIN_SCENE_LEN_FRAMES = 12
 
@@ -48,7 +58,6 @@ CAPTION_LENGTH = "short"
 
 
 NEAR_DUP_THRESHOLD = 6
-
 
 
 def run(cmd: list[str], cwd: Optional[Path] = None) -> None:
@@ -71,9 +80,6 @@ def download_youtube_query(query: str, downloads_dir: Path) -> Path:
     Returns the downloaded MP4 file path.
     """
     outtmpl = str(downloads_dir / "%(title).200s [%(id)s].%(ext)s")
-    
-
-
 
     cmd = [
         sys.executable, "-m", "yt_dlp",
@@ -105,7 +111,7 @@ def run_scenedetect_save_images(video_path: Path,
                                 out_dir: Path,
                                 threshold: float,
                                 min_scene_len: int) -> None:
-    
+
     for p in list(out_dir.glob("*.jpg")) + list(out_dir.glob("*.png")):
         p.unlink(missing_ok=True)
 
@@ -117,10 +123,9 @@ def run_scenedetect_save_images(video_path: Path,
         "--min-scene-len", str(min_scene_len),
         "save-images",
         "-o", str(out_dir),
-        "--num-images", "1",  
+        "--num-images", "1",
     ]
     run(cmd)
-
 
 
 def count_scene_images(out_dir: Path) -> int:
@@ -152,13 +157,10 @@ def run_scenedetect_fixed(video_path: Path, scenes_root: Path) -> Path:
     return out_dir
 
 
-
-
-
 def ahash(path: Path, size: int = 8) -> int:
     with Image.open(path) as im:
         im = im.convert("L").resize((size, size))
-        
+
         pixels = list(im.getdata())
     avg = sum(pixels) / len(pixels)
     bits = 0
@@ -180,7 +182,6 @@ def analyze_scene_diversity(images_dir: Path, near_dup_threshold: int = 6) -> No
     hashes = [(p, ahash(p)) for p in imgs]
     near_dup_pairs = []
 
-    
     for i in range(1, len(hashes)):
         p_prev, h_prev = hashes[i - 1]
         p_cur, h_cur = hashes[i]
@@ -201,7 +202,6 @@ def analyze_scene_diversity(images_dir: Path, near_dup_threshold: int = 6) -> No
         print("   Tip: raise threshold slightly or raise MIN_SCENE_LEN_FRAMES.")
 
 
-
 def load_moondream():
     """
     Loads Moondream locally (downloads weights once, then cached by HF).
@@ -215,9 +215,8 @@ def load_moondream():
     )
     tokenizer = AutoTokenizer.from_pretrained(MOONDREAM_MODEL_ID)
 
-    
     model.to(device)
-    
+
     model.eval()
 
     return model, tokenizer, device
@@ -237,7 +236,6 @@ def extract_scene_number(p: Path) -> int:
     """
     name = p.stem
 
-    
     m = re.search(r"(?:scene|Scene)[^\d]*0*(\d+)", name)
     if m:
         return int(m.group(1))
@@ -257,22 +255,18 @@ def caption_scenes(images_dir: Path) -> Dict[str, str]:
 
     imgs = list_scene_images(images_dir)
 
-    
     imgs_sorted = sorted(imgs, key=lambda p: (extract_scene_number(p), p.name))
-    
-    
+
     if MAX_CAPTIONS is not None and len(imgs_sorted) > MAX_CAPTIONS:
         step = max(1, len(imgs_sorted) // MAX_CAPTIONS)
         imgs_sorted = imgs_sorted[::step][:MAX_CAPTIONS]
 
-
     captions: Dict[str, str] = {}
 
-    
     fallback_counter = 1
 
     for img_path in imgs_sorted:
-        
+
         scene_num = extract_scene_number(img_path)
         if scene_num == -1:
             scene_num = fallback_counter
@@ -283,8 +277,6 @@ def caption_scenes(images_dir: Path) -> Dict[str, str]:
             im.thumbnail((256, 256))
             im = im.copy()
 
-        
-        
         with torch.inference_mode():
             result = model.caption(im, length=CAPTION_LENGTH)
         caption_text = result["caption"] if isinstance(result, dict) and "caption" in result else str(result)
@@ -301,10 +293,10 @@ def save_captions_json(captions: Dict[str, str], path: Path) -> None:
         json.dump(captions, f, ensure_ascii=False, indent=2)
 
 
-
 def load_captions_json(path: Path) -> Dict[str, str]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def find_scenes_exact(captions: Dict[str, str], word: str) -> List[str]:
     w = word.strip().lower()
@@ -314,8 +306,8 @@ def find_scenes_exact(captions: Dict[str, str], word: str) -> List[str]:
             hits.append(str(scene_id))
     return hits
 
+
 def find_scenes_fuzzy(captions: Dict[str, str], word: str, threshold: int = FUZZ_THRESHOLD) -> List[str]:
-    
     w = word.strip().lower()
     hits = []
     for scene_id, cap in captions.items():
@@ -325,8 +317,8 @@ def find_scenes_fuzzy(captions: Dict[str, str], word: str, threshold: int = FUZZ
             hits.append(str(scene_id))
     return hits
 
+
 def find_image_for_scene(images_dir: Path, scene_id: str) -> Optional[Path]:
-    
     sid = int(scene_id)
     patterns = [
         f"*Scene-{sid:03d}-*.jpg",
@@ -339,6 +331,7 @@ def find_image_for_scene(images_dir: Path, scene_id: str) -> Optional[Path]:
         if matches:
             return matches[0]
     return None
+
 
 def make_collage(image_paths: List[Path], out_path: Path, thumb_size=COLLAGE_THUMB) -> None:
     if not image_paths:
@@ -364,30 +357,165 @@ def make_collage(image_paths: List[Path], out_path: Path, thumb_size=COLLAGE_THU
         x = c * cell_w
         y = r * cell_h
 
-        
         ox = x + (cell_w - im.width) // 2
         oy = y + (cell_h - im.height) // 2
         collage.paste(im, (ox, oy))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     collage.save(out_path)
-    
 
+
+
+def build_vocab_from_captions(captions: Dict[str, str]) -> List[str]:
+    words = set()
+    for cap in captions.values():
+        tokens = re.findall(r"[A-Za-z']+", str(cap).lower())
+        words.update(tokens)
+    words = {w for w in words if len(w) >= 2}
+    return sorted(words)
+
+def make_ascii_upload_copy(video_path: Path) -> Path:
+    
+    safe_path = OUTPUT_ROOT / "gemini_upload_video.mp4"
+    shutil.copy(video_path, safe_path)
+    return safe_path
+
+
+
+def gemini_find_timestamps_in_video(video_path: Path, user_query: str, max_duration: int = 5) -> List[float]:
+    """
+    ✅ CHANGED: max_duration now defaults to 5 seconds instead of 25
+    """
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY (set it in .env or Environment Variables)")
+
+    client = genai.Client(api_key=api_key)
+
+    
+    trimmed = OUTPUT_ROOT / f"trimmed_{max_duration}s.mp4"
+    if not trimmed.exists():
+        print(f"Trimming video to {max_duration} seconds...")
+        cmd = [
+            FFMPEG_EXE,
+            "-y",
+            "-i", str(video_path),
+            "-t", str(max_duration),
+            "-c:v", "libx264",
+            "-crf", "28",
+            "-preset", "fast",
+            "-an",
+            str(trimmed),
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"✅ Trimmed video saved: {trimmed}")
+
+    safe_video = make_ascii_upload_copy(trimmed)
+    myfile = client.files.upload(file=str(safe_video))
+
+
+
+    while not myfile.state or myfile.state.name != "ACTIVE":
+        print("Processing video on Gemini...")
+        time.sleep(5)
+        myfile = client.files.get(name=myfile.name)
+
+    prompt_text = f"""
+You are a video understanding assistant.
+User request: {user_query}
+
+Return ONLY valid JSON in this exact format:
+{{"timestamps_seconds":[0.0, 1.23, 4.5]}}
+Pick timestamps that best match the request. Keep the list short (max 12).
+"""
+
+    try:
+        result = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[myfile, prompt_text],
+        )
+    except genai_errors.ClientError as e:
+        msg = str(e)
+        if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+            print("\n⚠️ Gemini quota exceeded (limit appears to be 0 for your project/key).")
+            print("Fix: create a Gemini API key in Google AI Studio, or enable billing for this project.")
+            return []  
+        raise
+
+    text = (result.text or "").strip()
+
+    try:
+        data = json.loads(text)
+        ts = data.get("timestamps_seconds", [])
+        return [float(x) for x in ts]
+    except Exception:
+        nums = re.findall(r"\b\d+(?:\.\d+)?\b", text)
+        return [float(x) for x in nums[:12]]
+
+
+def extract_frames_with_ffmpeg(video_path: Path, timestamps: List[float], out_dir: Path) -> List[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: List[Path] = []
+
+    for i, t in enumerate(timestamps, start=1):
+        out_img = out_dir / f"frame_{i:03d}_{t:.2f}s.jpg"
+
+        cmd = [
+            FFMPEG_EXE,
+            "-y",
+            "-ss", str(t),
+            "-i", str(video_path),
+            "-frames:v", "1",
+            str(out_img),
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if out_img.exists():
+            saved.append(out_img)
+
+    return saved
+
+
+def video_model_flow(video_path: Path) -> None:
+    user_query = input("Using a video model. What would you like me to find in the video?\n> ").strip()
+    if not user_query:
+        print("Empty input. Exiting.")
+        return
+
+    timestamps = gemini_find_timestamps_in_video(video_path, user_query, max_duration=5)  # ✅ CHANGED: 5 seconds
+    if not timestamps:
+        print("No timestamps returned by Gemini.")
+        return
+
+    print("Timestamps (seconds):", timestamps)
+
+    frames_dir = OUTPUT_ROOT / "gemini_frames"
+    frame_paths = extract_frames_with_ffmpeg(video_path, timestamps, frames_dir)
+
+    if not frame_paths:
+        print("No frames extracted.")
+        return
+
+    make_collage(frame_paths, COLLAGE_PATH)
+    print(f"✅ Saved collage to: {COLLAGE_PATH}")
+    os.startfile(str(COLLAGE_PATH))
 
 
 def search_loop(images_dir: Path, captions_path: Path) -> None:
     captions = load_captions_json(captions_path)
 
+    # ✅ שינוי 2: autocomplete
+    vocab = build_vocab_from_captions(captions)
+    completer = WordCompleter(vocab, ignore_case=True, match_middle=False)
+
     while True:
-        word = input("\nSearch the video using a word: ").strip()
+        word = prompt("Search the video using a word: ", completer=completer).strip()
         if not word:
             print("Empty input. Exiting search.")
             return
 
         exact = find_scenes_exact(captions, word)
-
         fuzzy = find_scenes_fuzzy(captions, word, threshold=FUZZ_THRESHOLD)
-
         hits = fuzzy if fuzzy else exact
 
         if not hits:
@@ -417,14 +545,26 @@ def search_loop(images_dir: Path, captions_path: Path) -> None:
         os.startfile(str(COLLAGE_PATH))
 
 
-
-
 def main() -> None:
     downloads_dir, scenes_root = ensure_dirs()
+    video_path = downloads_dir / "short.mp4"
 
-   
+    mode = input("Choose search mode: (1) image model, (2) video model: ").strip()
+
+    if mode == "2":
+        mp4s = sorted((OUTPUT_ROOT / "downloads").glob("*.mp4"),
+                      key=lambda p: p.stat().st_mtime,
+                      reverse=True)
+        if mp4s:
+            video_path = mp4s[0]
+        else:
+            print("No local video found. Downloading...")
+            video_path = download_youtube_query(QUERY, downloads_dir)
+
+        video_model_flow(video_path)
+        return
+
     if CAPTIONS_JSON.exists():
-        
         scene_dirs = [p for p in scenes_root.iterdir() if p.is_dir()]
         if not scene_dirs:
             print(f"Found {CAPTIONS_JSON} but no scenes folders in {scenes_root}.")
@@ -434,7 +574,6 @@ def main() -> None:
         print("Using scenes folder:", chosen_images_dir)
         search_loop(chosen_images_dir, CAPTIONS_JSON)
         return
-
 
     print("Output root:", OUTPUT_ROOT)
     print("Downloading query:", QUERY)
